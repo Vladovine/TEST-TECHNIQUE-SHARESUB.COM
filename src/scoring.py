@@ -1,60 +1,23 @@
-"""Risk scoring utilities and CLI for the Sharesub risk monitor project.
-
-This module loads the cleaned SQLite database, computes user-level features,
-builds a deterministic risk score, and exports the scored CSV.
-
-Usage:
-    python -m src.scoring --input data/processed/risk_monitor_clean.sqlite \
-                          --output outputs/subscribers_risk_scored.csv
-"""
-
 from __future__ import annotations
 
 import argparse
 import sqlite3
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
 
 
-PAYMENT_STATUS_WEIGHTS: Dict[str, float] = {
-    "succeeded": 0.0,
-    "failed": 1.0,
-    "disputed": 1.5,
-    "refunded": 0.8,
-    "pending": 0.3,
-    "canceled": 0.2,
-}
-
-COMPLAINT_TYPE_WEIGHTS: Dict[str, float] = {
-    "access_denied": 1.2,
-    "fraud_suspicion": 1.5,
-    "owner_unresponsive": 1.1,
-    "subscription_inactive": 1.0,
-    "billing_issue": 0.8,
-    "wrong_credentials": 0.7,
-    "other": 0.5,
-}
-
-COMPLAINT_STATUS_WEIGHTS: Dict[str, float] = {
-    "open": 1.0,
-    "in_progress": 0.9,
-    "escalated": 1.3,
-    "resolved": 0.5,
-    "closed": 0.4,
-}
-
-
-# -----------------------------
-# Helpers
-# -----------------------------
 def to_utc(series: pd.Series) -> pd.Series:
+    """Convertit une colonne de dates texte ISO en datetime UTC."""
     return pd.to_datetime(series, utc=True, errors="coerce")
 
 
 def robust_minmax(series: pd.Series, lower_q: float = 0.05, upper_q: float = 0.95) -> pd.Series:
+    """
+    Normalise une série entre 0 et 1 à partir de quantiles robustes.
+    Si la série est plate ou vide, renvoie 0.
+    """
     s = pd.to_numeric(series, errors="coerce").fillna(0.0)
     lo = s.quantile(lower_q)
     hi = s.quantile(upper_q)
@@ -64,25 +27,105 @@ def robust_minmax(series: pd.Series, lower_q: float = 0.05, upper_q: float = 0.9
 
 
 def safe_div(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    """Division sûre avec remplacement des divisions par zéro par 0."""
     num = pd.to_numeric(numerator, errors="coerce").fillna(0.0)
     den = pd.to_numeric(denominator, errors="coerce").replace(0, np.nan)
     return (num / den).fillna(0.0)
 
 
 def days_between(later: pd.Series, earlier: pd.Series) -> pd.Series:
+    """Calcule un écart en jours entre deux colonnes datetime."""
     delta = later - earlier
     return delta.dt.total_seconds().div(86400).fillna(0.0)
 
 
 def clip_days(series: pd.Series, max_days: float = 365.0) -> pd.Series:
+    """Limite une durée en jours pour éviter que quelques extrêmes n'écrasent le score."""
     s = pd.to_numeric(series, errors="coerce").fillna(0.0)
     return s.clip(lower=0.0, upper=max_days)
+
+
+def normalize_text(value):
+    if pd.isna(value):
+        return pd.NA
+    s = str(value).strip()
+    s = " ".join(s.split())
+    return s
+
+
+def normalize_text_lower(value):
+    s = normalize_text(value)
+    if pd.isna(s):
+        return pd.NA
+    return s.lower()
+
+
+def strip_accents(value):
+    if pd.isna(value):
+        return pd.NA
+    s = normalize_text(value)
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s
+
+
+def normalize_currency(value):
+    if pd.isna(value):
+        return pd.NA
+    s = normalize_text(value)
+    return s.upper()
+
+
+def normalize_country(value):
+    if pd.isna(value):
+        return pd.NA
+    s = normalize_text(value)
+    s = strip_accents(s).upper()
+    country_aliases = {
+        "FR": "FR",
+        "FRA": "FR",
+        "FRANCE": "FR",
+        "FRANCAIS": "FR",
+        "FRANCAISE": "FR",
+    }
+    return country_aliases.get(s, s)
+
+
+def normalize_status_text(value):
+    if pd.isna(value):
+        return pd.NA
+
+    s = normalize_text_lower(value)
+    s = strip_accents(s)
+
+    replacements = {
+        "suceeded": "succeeded",
+        "success": "succeeded",
+        "succeeded": "succeeded",
+        "failed": "failed",
+        "pending": "pending",
+        "refunded": "refunded",
+        "disputed": "disputed",
+        "canceled": "canceled",
+        "cancelled": "canceled",
+        "open": "open",
+        "in_progress": "in_progress",
+        "escalated": "escalated",
+        "resolved": "resolved",
+        "closed": "closed",
+        "access denied": "access_denied",
+        "acces refuse": "access_denied",
+    }
+
+    return replacements.get(s, s)
 
 
 def canonical_complaint_type(value: str) -> str:
     if pd.isna(value):
         return "other"
     s = str(value).strip().lower()
+    s = strip_accents(s)
     mapping = {
         "acces refuse": "access_denied",
         "access denied": "access_denied",
@@ -101,75 +144,81 @@ def canonical_complaint_type(value: str) -> str:
     return mapping.get(s, s)
 
 
-def prepare_export_df(df: pd.DataFrame, cols: list[str], datetime_cols: Iterable[str] | None = None) -> pd.DataFrame:
-    out = df.loc[:, cols].copy()
-    datetime_cols = list(datetime_cols or [])
-    for col in datetime_cols:
-        out[col] = pd.to_datetime(out[col], utc=True, errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    return out
-
-
-# -----------------------------
-# IO
-# -----------------------------
-def load_clean_data(db_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_clean_data(db_path: Path) -> dict[str, pd.DataFrame]:
+    """Charge les 5 tables de la base nettoyée SQLite."""
     if not db_path.exists():
         raise FileNotFoundError(f"Fichier introuvable : {db_path}")
 
-    with sqlite3.connect(db_path) as conn:
-        users = pd.read_sql_query("SELECT * FROM users;", conn)
-        subscriptions = pd.read_sql_query("SELECT * FROM subscriptions;", conn)
-        memberships = pd.read_sql_query("SELECT * FROM memberships;", conn)
-        payments = pd.read_sql_query("SELECT * FROM payments;", conn)
-        complaints = pd.read_sql_query("SELECT * FROM complaints;", conn)
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = {}
+        for table in ["users", "subscriptions", "memberships", "payments", "complaints"]:
+            tables[table] = pd.read_sql_query(f"SELECT * FROM {table};", conn)
+        return tables
+    finally:
+        conn.close()
 
-    return users, subscriptions, memberships, payments, complaints
 
-
-# -----------------------------
-# Reference date
-# -----------------------------
-def compute_reference_date(
+def build_reference_date(
     users: pd.DataFrame,
     subscriptions: pd.DataFrame,
     memberships: pd.DataFrame,
     payments: pd.DataFrame,
     complaints: pd.DataFrame,
 ) -> pd.Timestamp:
-    # Exclure signup_at_utc du calcul de référence car certaines valeurs sont futures/anormales.
+    """Calcule une date de référence à partir des signaux opérationnels uniquement."""
+    for df, cols in [
+        (users, ["last_seen_at_utc"]),
+        (subscriptions, ["created_at_utc"]),
+        (memberships, ["joined_at_utc", "left_at_utc"]),
+        (payments, ["created_at_utc", "captured_at_utc"]),
+        (complaints, ["created_at_utc", "resolved_at_utc"]),
+    ]:
+        for col in cols:
+            df[col] = to_utc(df[col])
+
     date_series = pd.concat(
         [
-            pd.to_datetime(users["last_seen_at_utc"], utc=True, errors="coerce"),
-            pd.to_datetime(subscriptions["created_at_utc"], utc=True, errors="coerce"),
-            pd.to_datetime(memberships["joined_at_utc"], utc=True, errors="coerce"),
-            pd.to_datetime(memberships["left_at_utc"], utc=True, errors="coerce"),
-            pd.to_datetime(payments["created_at_utc"], utc=True, errors="coerce"),
-            pd.to_datetime(payments["captured_at_utc"], utc=True, errors="coerce"),
-            pd.to_datetime(complaints["created_at_utc"], utc=True, errors="coerce"),
-            pd.to_datetime(complaints["resolved_at_utc"], utc=True, errors="coerce"),
+            users["last_seen_at_utc"],
+            subscriptions["created_at_utc"],
+            memberships["joined_at_utc"],
+            memberships["left_at_utc"],
+            payments["created_at_utc"],
+            payments["captured_at_utc"],
+            complaints["created_at_utc"],
+            complaints["resolved_at_utc"],
         ],
         ignore_index=True,
     ).dropna()
 
     if date_series.empty:
-        raise ValueError("Impossible de calculer la date de référence : aucune date opérationnelle valide n'a été trouvée.")
+        raise ValueError("Impossible de calculer la date de référence : aucune date exploitable.")
 
     return date_series.max().normalize() + pd.Timedelta(days=1)
 
 
-# -----------------------------
-# Feature engineering
-# -----------------------------
 def build_payment_features(
     payments: pd.DataFrame,
     subscriptions: pd.DataFrame,
+    users: pd.DataFrame,
     reference_date: pd.Timestamp,
-    valid_user_ids: set[int],
 ) -> pd.DataFrame:
+    """Construit les features paiements par user."""
+    payment_status_weights = {
+        "succeeded": 0.0,
+        "failed": 1.0,
+        "disputed": 1.5,
+        "refunded": 0.8,
+        "pending": 0.3,
+        "canceled": 0.2,
+    }
+
     p = payments.copy()
+    p["created_at_utc"] = to_utc(p["created_at_utc"])
+    p["captured_at_utc"] = to_utc(p["captured_at_utc"])
     p["status_key"] = p["status"].astype(str).str.lower()
 
-    for st in PAYMENT_STATUS_WEIGHTS.keys():
+    for st in payment_status_weights.keys():
         p[f"is_{st}"] = (p["status_key"] == st).astype(int)
 
     payment_last = p.groupby("user_id", as_index=False).agg(
@@ -204,6 +253,8 @@ def build_payment_features(
 
     payment_agg = payment_agg.merge(brand_agg, on="user_id", how="left")
     payment_agg = payment_agg.merge(payment_last, on="user_id", how="left")
+
+    valid_user_ids = set(users["id"].dropna().astype(int))
     payment_agg = payment_agg[payment_agg["user_id"].isin(valid_user_ids)].copy()
 
     payment_agg["payment_issue_weight_sum"] = (
@@ -224,23 +275,30 @@ def build_payment_features(
         payment_agg["payment_last_at"],
     )
 
-    payment_agg["days_since_last_payment"] = clip_days(payment_agg["days_since_last_payment_raw"], 1095)
+    payment_agg["days_since_last_payment"] = clip_days(
+        payment_agg["days_since_last_payment_raw"],
+        1095,
+    )
 
     payment_agg["payment_recent_event_risk_raw"] = np.where(
         payment_agg["payment_total_count"] > 0,
         1 / (1 + payment_agg["days_since_last_payment"] / 30.0),
         0.0,
     )
+    payment_agg["payment_recent_event_risk_raw"] = payment_agg[
+        "payment_recent_event_risk_raw"
+    ].clip(0, 1)
 
-    payment_agg["payment_recent_event_risk_raw"] = payment_agg["payment_recent_event_risk_raw"].clip(0, 1)
     return payment_agg
 
 
 def build_membership_features(
     memberships: pd.DataFrame,
     subscriptions: pd.DataFrame,
+    users: pd.DataFrame,
     reference_date: pd.Timestamp,
 ) -> pd.DataFrame:
+    """Construit les features memberships par user."""
     m = memberships.copy()
     m = m.merge(
         subscriptions[["id", "brand"]],
@@ -250,11 +308,12 @@ def build_membership_features(
         suffixes=("", "_sub"),
     )
 
-    m["joined_at_utc"] = pd.to_datetime(m["joined_at_utc"], utc=True, errors="coerce")
-    m["left_at_utc"] = pd.to_datetime(m["left_at_utc"], utc=True, errors="coerce")
+    m["joined_at_utc"] = to_utc(m["joined_at_utc"])
+    m["left_at_utc"] = to_utc(m["left_at_utc"])
 
     m["membership_end_at"] = m["left_at_utc"].fillna(reference_date)
-    m["membership_duration_days"] = days_between(m["membership_end_at"], m["joined_at_utc"]).clip(lower=0)
+    m["membership_duration_days"] = days_between(m["membership_end_at"], m["joined_at_utc"])
+    m["membership_duration_days"] = m["membership_duration_days"].clip(lower=0)
 
     m["is_exit"] = m["left_at_utc"].notna().astype(int)
     m["is_current"] = m["left_at_utc"].isna().astype(int)
@@ -288,7 +347,8 @@ def build_membership_features(
     )
 
     membership_agg["days_since_last_membership_end"] = clip_days(
-        membership_agg["days_since_last_membership_end_raw"], 1095
+        membership_agg["days_since_last_membership_end_raw"],
+        1095,
     )
 
     membership_agg["membership_recent_event_risk_raw"] = np.where(
@@ -296,7 +356,10 @@ def build_membership_features(
         1 / (1 + membership_agg["days_since_last_membership_end"] / 30.0),
         0.0,
     )
-    membership_agg["membership_recent_event_risk_raw"] = membership_agg["membership_recent_event_risk_raw"].clip(0, 1)
+    membership_agg["membership_recent_event_risk_raw"] = membership_agg[
+        "membership_recent_event_risk_raw"
+    ].clip(0, 1)
+
     return membership_agg
 
 
@@ -304,6 +367,7 @@ def build_complaint_features(
     complaints: pd.DataFrame,
     reference_date: pd.Timestamp,
 ) -> pd.DataFrame:
+    """Construit les features réclamations par user, côté reporter et target."""
     c = complaints.copy()
 
     c["created_at_utc"] = pd.to_datetime(c["created_at_utc"], utc=True, errors="coerce")
@@ -311,8 +375,26 @@ def build_complaint_features(
     c["type_key"] = c["type"].apply(canonical_complaint_type)
     c["status_key"] = c["status"].astype(str).str.lower()
 
-    c["complaint_type_weight"] = c["type_key"].map(COMPLAINT_TYPE_WEIGHTS).fillna(0.5)
-    c["complaint_status_weight"] = c["status_key"].map(COMPLAINT_STATUS_WEIGHTS).fillna(0.5)
+    complaint_type_weights = {
+        "access_denied": 1.2,
+        "fraud_suspicion": 1.5,
+        "owner_unresponsive": 1.1,
+        "subscription_inactive": 1.0,
+        "billing_issue": 0.8,
+        "wrong_credentials": 0.7,
+        "other": 0.5,
+    }
+
+    complaint_status_weights = {
+        "open": 1.0,
+        "in_progress": 0.9,
+        "escalated": 1.3,
+        "resolved": 0.5,
+        "closed": 0.4,
+    }
+
+    c["complaint_type_weight"] = c["type_key"].map(complaint_type_weights).fillna(0.5)
+    c["complaint_status_weight"] = c["status_key"].map(complaint_status_weights).fillna(0.5)
     c["complaint_severity"] = c["complaint_type_weight"] * c["complaint_status_weight"]
 
     c["is_open"] = c["status_key"].isin(["open", "in_progress"]).astype(int)
@@ -377,7 +459,8 @@ def build_complaint_features(
     )
 
     complaint_agg["days_since_last_complaint"] = clip_days(
-        complaint_agg["days_since_last_complaint_raw"], 1095
+        complaint_agg["days_since_last_complaint_raw"],
+        1095,
     )
 
     complaint_agg["complaint_recent_event_risk_raw"] = np.where(
@@ -385,26 +468,38 @@ def build_complaint_features(
         1 / (1 + complaint_agg["days_since_last_complaint"] / 30.0),
         0.0,
     )
-    complaint_agg["complaint_recent_event_risk_raw"] = complaint_agg["complaint_recent_event_risk_raw"].clip(0, 1)
+    complaint_agg["complaint_recent_event_risk_raw"] = complaint_agg[
+        "complaint_recent_event_risk_raw"
+    ].clip(0, 1)
+
     return complaint_agg
 
 
-def merge_features(
+def build_feature_table(
     users: pd.DataFrame,
-    payment_agg: pd.DataFrame,
-    membership_agg: pd.DataFrame,
-    complaint_agg: pd.DataFrame,
-    reference_date: pd.Timestamp,
+    subscriptions: pd.DataFrame,
+    memberships: pd.DataFrame,
+    payments: pd.DataFrame,
+    complaints: pd.DataFrame,
 ) -> pd.DataFrame:
-    features = users[[
-        "id",
-        "email",
-        "country",
-        "signup_at_utc",
-        "last_seen_at_utc",
-        "status",
-        "status_is_anomalous",
-    ]].copy().rename(columns={"id": "user_id"})
+    """Construit la table finale de features par user et le score de risque."""
+    reference_date = build_reference_date(users, subscriptions, memberships, payments, complaints)
+
+    payment_agg = build_payment_features(payments, subscriptions, users, reference_date)
+    membership_agg = build_membership_features(memberships, subscriptions, users, reference_date)
+    complaint_agg = build_complaint_features(complaints, reference_date)
+
+    features = users[
+        [
+            "id",
+            "email",
+            "country",
+            "signup_at_utc",
+            "last_seen_at_utc",
+            "status",
+            "status_is_anomalous",
+        ]
+    ].copy().rename(columns={"id": "user_id"})
 
     features["signup_at_utc"] = pd.to_datetime(features["signup_at_utc"], utc=True, errors="coerce")
     features["last_seen_at_utc"] = pd.to_datetime(features["last_seen_at_utc"], utc=True, errors="coerce")
@@ -445,69 +540,77 @@ def merge_features(
         (features["payment_total_count"] + features["membership_total_count"] + features["complaint_total_count"]) > 0
     ).astype(int)
 
-    return features
+    features["payment_inactivity_risk_raw"] = clip_days(features["days_since_last_payment"], 365) / 365.0
+    features["membership_recent_exit_risk_raw"] = np.where(
+        features["membership_exit_count"] > 0,
+        1 - (features["days_since_last_membership_end"] / 365.0),
+        0.0,
+    )
+    features["membership_recent_exit_risk_raw"] = pd.Series(
+        features["membership_recent_exit_risk_raw"], index=features.index
+    ).clip(0, 1)
 
-
-def compute_score(features: pd.DataFrame) -> pd.DataFrame:
-    out = features.copy()
-
-    out["payment_risk_raw"] = (
-        np.log1p(out["payment_failed_count"])
-        + 1.5 * np.log1p(out["payment_disputed_count"])
-        + 0.8 * np.log1p(out["payment_refunded_count"])
-        + 0.3 * np.log1p(out["payment_pending_count"])
-        + 0.2 * np.log1p(out["payment_canceled_count"])
-        + 2.0 * out["payment_issue_rate"]
-        + 0.5 * out["payment_recent_event_risk_raw"]
+    features["payment_risk_raw"] = (
+        np.log1p(features["payment_failed_count"])
+        + 1.5 * np.log1p(features["payment_disputed_count"])
+        + 0.8 * np.log1p(features["payment_refunded_count"])
+        + 0.3 * np.log1p(features["payment_pending_count"])
+        + 0.2 * np.log1p(features["payment_canceled_count"])
+        + 2.0 * features["payment_issue_rate"]
+        + 0.5 * features["payment_inactivity_risk_raw"]
     )
 
-    out["complaint_risk_raw"] = (
-        1.2 * np.log1p(out["complaint_open_count"])
-        + 1.5 * np.log1p(out["complaint_escalated_count"])
-        + 0.8 * np.log1p(out["complaint_reporter_severity_sum"])
-        + 1.2 * np.log1p(out["complaint_target_severity_sum"])
-        + 0.8 * out["complaint_recent_event_risk_raw"]
+    features["complaint_risk_raw"] = (
+        1.2 * np.log1p(features["complaint_open_count"])
+        + 1.5 * np.log1p(features["complaint_escalated_count"])
+        + 0.8 * np.log1p(features["complaint_reporter_severity_sum"])
+        + 1.2 * np.log1p(features["complaint_target_severity_sum"])
+        + 0.8 * features["complaint_recent_event_risk_raw"]
     )
 
-    out["membership_risk_raw"] = (
-        1.0 * np.log1p(out["membership_exit_count"])
-        + 0.7 * np.log1p(out["short_membership_count"])
-        + 0.3 * np.log1p(out["distinct_subscription_count"])
-        + 0.2 * np.log1p(out["distinct_brand_count"])
-        + 0.5 * out["membership_churn_rate"]
-        + 0.3 * out["brand_switch_rate"]
-        + 0.7 * out["membership_recent_event_risk_raw"]
+    features["membership_risk_raw"] = (
+        1.0 * np.log1p(features["membership_exit_count"])
+        + 0.7 * np.log1p(features["short_membership_count"])
+        + 0.3 * np.log1p(features["distinct_subscription_count"])
+        + 0.2 * np.log1p(features["distinct_brand_count"])
+        + 0.5 * features["membership_churn_rate"]
+        + 0.3 * features["brand_switch_rate"]
+        + 0.7 * features["membership_recent_exit_risk_raw"]
     )
 
-    out["recency_risk_raw"] = out["days_since_last_seen"] / 365.0
+    features["recency_risk_raw"] = features["days_since_last_seen"] / 365.0
 
-    out["payment_risk_norm"] = robust_minmax(out["payment_risk_raw"])
-    out["complaint_risk_norm"] = robust_minmax(out["complaint_risk_raw"])
-    out["membership_risk_norm"] = robust_minmax(out["membership_risk_raw"])
-    out["recency_risk_norm"] = robust_minmax(out["recency_risk_raw"])
+    features["payment_risk_norm"] = robust_minmax(features["payment_risk_raw"])
+    features["complaint_risk_norm"] = robust_minmax(features["complaint_risk_raw"])
+    features["membership_risk_norm"] = robust_minmax(features["membership_risk_raw"])
+    features["recency_risk_norm"] = robust_minmax(features["recency_risk_raw"])
 
-    out["risk_score"] = (
-        100 * (
-            0.40 * out["payment_risk_norm"]
-            + 0.30 * out["complaint_risk_norm"]
-            + 0.20 * out["membership_risk_norm"]
-            + 0.10 * out["recency_risk_norm"]
+    features["risk_score"] = (
+        100
+        * (
+            0.40 * features["payment_risk_norm"]
+            + 0.30 * features["complaint_risk_norm"]
+            + 0.20 * features["membership_risk_norm"]
+            + 0.10 * features["recency_risk_norm"]
         )
     ).round(2)
 
-    out["risk_tier"] = pd.cut(
-        out["risk_score"],
+    features["risk_tier"] = pd.cut(
+        features["risk_score"],
         bins=[-0.01, 24.99, 49.99, 74.99, 100.0],
         labels=["low", "watch", "high", "critical"],
     ).astype(str)
 
-    out["risk_tier"] = out["risk_tier"].replace("nan", "low")
-    out = out.sort_values("risk_score", ascending=False).reset_index(drop=True)
-    out["risk_rank"] = np.arange(1, len(out) + 1)
-    return out
+    features["risk_tier"] = features["risk_tier"].replace("nan", "low")
+
+    features = features.sort_values("risk_score", ascending=False).reset_index(drop=True)
+    features["risk_rank"] = np.arange(1, len(features) + 1)
+
+    return features
 
 
-def export_scored_csv(final_df: pd.DataFrame, output_path: Path) -> Path:
+def export_scored_csv(features: pd.DataFrame, output_path: Path) -> Path:
+    """Exporte le CSV scoré final."""
     final_cols = [
         "user_id",
         "email",
@@ -563,73 +666,50 @@ def export_scored_csv(final_df: pd.DataFrame, output_path: Path) -> Path:
         "recency_risk_norm",
         "risk_score",
         "risk_tier",
-        "risk_rank",
     ]
 
-    missing = [c for c in final_cols if c not in final_df.columns]
-    if missing:
-        raise KeyError(f"Colonnes manquantes dans le résultat final : {missing}")
+    missing_cols = [c for c in final_cols if c not in features.columns]
+    if missing_cols:
+        raise KeyError(f"Colonnes manquantes dans features : {missing_cols}")
 
-    export_df = final_df[final_cols].copy()
+    final_df = features[final_cols].copy()
+    final_df = final_df.sort_values("risk_score", ascending=False).reset_index(drop=True)
+    final_df["risk_rank"] = np.arange(1, len(final_df) + 1)
+
+    final_cols_output = final_cols + ["risk_rank"]
+    final_df = final_df[final_cols_output]
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    export_df.to_csv(output_path, index=False)
+    final_df.to_csv(output_path, index=False)
     return output_path
 
 
-# -----------------------------
-# Pipeline
-# -----------------------------
-def run_pipeline(input_db: Path, output_csv: Path) -> pd.DataFrame:
-    users, subscriptions, memberships, payments, complaints = load_clean_data(input_db)
-
-    # Sécurisation des colonnes temporelles utiles
-    for df, cols in [
-        (users, ["last_seen_at_utc"]),
-        (subscriptions, ["created_at_utc"]),
-        (memberships, ["joined_at_utc", "left_at_utc"]),
-        (payments, ["created_at_utc", "captured_at_utc"]),
-        (complaints, ["created_at_utc", "resolved_at_utc"]),
-    ]:
-        for col in cols:
-            df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
-
-    reference_date = compute_reference_date(users, subscriptions, memberships, payments, complaints)
-    valid_user_ids = set(users["id"].dropna().astype(int))
-
-    payment_agg = build_payment_features(payments, subscriptions, reference_date, valid_user_ids)
-    membership_agg = build_membership_features(memberships, subscriptions, reference_date)
-    complaint_agg = build_complaint_features(complaints, reference_date)
-
-    features = merge_features(users, payment_agg, membership_agg, complaint_agg, reference_date)
-    scored = compute_score(features)
-
-    export_scored_csv(scored, output_csv)
-    return scored
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compute risk features and export the scored CSV.")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Construire le CSV scoré Risk Monitor.")
     parser.add_argument(
         "--input",
         type=Path,
         default=Path("data/processed/risk_monitor_clean.sqlite"),
-        help="Chemin vers la base SQLite nettoyée",
+        help="Chemin vers la base SQLite nettoyée.",
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("outputs/subscribers_risk_scored.csv"),
-        help="Chemin du CSV scoré à générer",
+        help="Chemin du CSV scoré à produire.",
     )
-    return parser
-
-
-def main() -> None:
-    parser = build_arg_parser()
     args = parser.parse_args()
-    scored = run_pipeline(args.input, args.output)
+
+    tables = load_clean_data(args.input)
+    features = build_feature_table(
+        tables["users"],
+        tables["subscriptions"],
+        tables["memberships"],
+        tables["payments"],
+        tables["complaints"],
+    )
+    export_scored_csv(features, args.output)
     print(f"CSV scoré généré : {args.output}")
-    print(scored[["user_id", "risk_score", "risk_tier", "risk_rank"]].head(10).to_string(index=False))
 
 
 if __name__ == "__main__":
