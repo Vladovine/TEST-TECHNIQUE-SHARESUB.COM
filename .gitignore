@@ -6,7 +6,5 @@ __pycache__/
 data/raw/*.db
 data/raw/*.sqlite
 data/raw/*.sqlite3
-data/processed/
-outputs/
 data/app_state.sqlite
 data/agent_logs/
