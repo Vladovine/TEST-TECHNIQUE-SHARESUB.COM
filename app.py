@@ -17,9 +17,16 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 import streamlit as st
+
+try:
+    from src.agent import analyze_subscriber_as_dict
+except Exception as exc:  # pragma: no cover
+    analyze_subscriber_as_dict = None
+    AGENT_IMPORT_ERROR = str(exc)
+else:
+    AGENT_IMPORT_ERROR = None
 
 
 # -----------------------------------------------------------------------------
@@ -33,7 +40,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_ROOT = Path(__file__).resolve().parent
+APP_ROOT = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 SCORING_CSV = APP_ROOT / "outputs" / "subscribers_risk_scored.csv"
 CLEAN_DB = APP_ROOT / "data" / "processed" / "risk_monitor_clean.sqlite"
 STATE_DB = APP_ROOT / "data" / "app_state.sqlite"
@@ -87,6 +94,20 @@ def fmt_num(value: Any, decimals: int = 2) -> str:
         return display_value(value)
 
 
+def fmt_confidence(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        if pd.isna(value):
+            return "—"
+    except Exception:
+        pass
+    try:
+        return f"{float(value) * 100:.0f}%"
+    except Exception:
+        return display_value(value)
+
+
 def clean_for_display(df: pd.DataFrame, datetime_cols: tuple[str, ...] = ()) -> pd.DataFrame:
     """Prepare a dataframe for a readable UI without using applymap."""
     out = df.copy()
@@ -135,6 +156,85 @@ def risk_badge(row: pd.Series) -> str:
     if tier == "watch":
         return "À surveiller"
     return "Faible"
+
+
+def render_agent_panel(row: pd.Series, selected_user_id: int) -> None:
+    """Rend le panneau IA dans l'onglet dédié du subscriber sélectionné."""
+    st.markdown("##### Analyse IA")
+    st.caption(
+        "L’agent résume le cas et propose une recommandation d’action à partir des signaux déjà calculés."
+    )
+
+    if analyze_subscriber_as_dict is None:
+        st.error(
+            f"Agent IA indisponible : {display_value(AGENT_IMPORT_ERROR)}. Vérifie src/agent.py, les prompts et OPENAI_API_KEY."
+        )
+        return
+
+    agent_state = st.session_state.setdefault("agent_results", {})
+    cached = agent_state.get(int(selected_user_id))
+
+    ctrl_cols = st.columns([1, 1, 4])
+    with ctrl_cols[0]:
+        if st.button(
+            "Lancer l’analyse IA",
+            key=f"run_agent_{selected_user_id}",
+            use_container_width=True,
+        ):
+            with st.spinner("Analyse IA en cours..."):
+                try:
+                    cached = analyze_subscriber_as_dict(row)
+                    agent_state[int(selected_user_id)] = cached
+                    st.session_state.agent_results = agent_state
+                    st.success("Analyse IA générée.")
+                except Exception as exc:
+                    st.error(f"Impossible de lancer l’analyse IA : {exc}")
+                    return
+    with ctrl_cols[1]:
+        if cached and st.button(
+            "Effacer le résultat",
+            key=f"clear_agent_{selected_user_id}",
+            use_container_width=True,
+        ):
+            agent_state.pop(int(selected_user_id), None)
+            st.session_state.agent_results = agent_state
+            st.rerun()
+
+    if not cached:
+        st.info("Lance l’analyse IA pour obtenir un résumé et une recommandation.")
+        return
+
+    analyst = cached.get("analyst", {}) if isinstance(cached, dict) else {}
+    decider = cached.get("decider", {}) if isinstance(cached, dict) else {}
+    analyst_content = analyst.get("content", {}) if isinstance(analyst, dict) else {}
+    decider_content = decider.get("content", {}) if isinstance(decider, dict) else {}
+
+    agent_cols = st.columns(2)
+    with agent_cols[0]:
+        st.markdown("###### Résumé structuré")
+        st.write(display_value(analyst_content.get("summary")))
+        st.write(f"**Confiance :** {fmt_confidence(analyst_content.get('confidence'))}")
+        st.write("**Signaux repérés :**")
+        signals = analyst_content.get("signals", [])
+        if isinstance(signals, list) and signals:
+            for signal in signals:
+                st.write(f"- {display_value(signal)}")
+        else:
+            st.write("- —")
+        st.write(f"**Comparaison à la base :** {display_value(analyst_content.get('comparison_to_base'))}")
+
+    with agent_cols[1]:
+        st.markdown("###### Recommandation")
+        st.metric("Action proposée", display_value(decider_content.get("recommendation")))
+        st.write(f"**Confiance :** {fmt_confidence(decider_content.get('confidence'))}")
+        st.write(f"**Justification :** {display_value(decider_content.get('justification'))}")
+        st.write(f"**Modèle analyse :** {display_value(analyst.get('model'))}")
+        st.write(f"**Modèle décision :** {display_value(decider.get('model'))}")
+        st.write(f"**Latence analyse :** {fmt_num(analyst.get('latency_ms'), 0)} ms")
+        st.write(f"**Latence décision :** {fmt_num(decider.get('latency_ms'), 0)} ms")
+
+    with st.expander("Voir le contexte transmis à l’agent"):
+        st.json(cached.get("context", {}))
 
 
 # -----------------------------------------------------------------------------
@@ -568,7 +668,7 @@ current_action_value = row.get("action") if pd.notna(row.get("action")) else Non
 current_action_label = friendly_action(current_action_value)
 notes = display_value(row.get("note"))
 
-summary_tab, history_tab, actions_tab = st.tabs(["Résumé", "Historique", "Actions"])
+summary_tab, history_tab, actions_tab, agent_tab = st.tabs(["Résumé", "Historique", "Actions", "Analyse IA"])
 
 with summary_tab:
     st.markdown("##### Résumé rapide")
@@ -617,7 +717,7 @@ with history_tab:
     if user_payments.empty:
         st.info("Aucun paiement pour ce subscriber.")
     else:
-        subscriptions_tbl = tables["subscriptions"][ ["id", "brand", "price_cents", "currency"] ].copy()
+        subscriptions_tbl = tables["subscriptions"][["id", "brand", "price_cents", "currency"]].copy()
         payments_history = user_payments.merge(
             subscriptions_tbl,
             left_on="subscription_id",
@@ -650,7 +750,7 @@ with history_tab:
     if user_memberships.empty:
         st.info("Aucun membership pour ce subscriber.")
     else:
-        subscriptions_tbl = tables["subscriptions"][ ["id", "brand", "price_cents", "currency"] ].copy()
+        subscriptions_tbl = tables["subscriptions"][["id", "brand", "price_cents", "currency"]].copy()
         memberships_history = user_memberships.merge(
             subscriptions_tbl,
             left_on="subscription_id",
@@ -747,6 +847,9 @@ with actions_tab:
         action_view["Date"] = pd.to_datetime(action_view["Date"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M UTC")
         action_view["Action"] = action_view["Action"].map(friendly_action)
         st.dataframe(clean_for_display(action_view), use_container_width=True, hide_index=True)
+
+with agent_tab:
+    render_agent_panel(row, int(selected_user_id))
 
 st.divider()
 st.subheader("Journal des actions global")
